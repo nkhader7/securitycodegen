@@ -10,8 +10,24 @@ import requests
 import streamlit as st
 
 
-MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
-OLLAMA_CHAT_PATH = "/api/chat"
+DEFAULT_MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
+
+
+def _get_secret(name: str) -> Optional[str]:
+    """Safely retrieve a Streamlit secret when configured."""
+
+    secrets = getattr(st, "secrets", None)
+    if secrets is None:
+        return None
+
+    getter = getattr(secrets, "get", None)
+    if callable(getter):
+        return getter(name)
+
+    try:
+        return secrets[name]  # type: ignore[index]
+    except Exception:  # pragma: no cover - defensive for unexpected secrets objects
+        return None
 
 
 @dataclass
@@ -62,7 +78,12 @@ def _read_uploaded_file(upload) -> Optional[str]:
         return None
 
     try:
-        data = upload.read()
+        # ``UploadedFile.read`` exhausts the underlying buffer. When Streamlit reruns the
+        # script (e.g., due to widget interaction) the same ``UploadedFile`` instance is
+        # reused with its pointer already positioned at EOF, yielding empty content.
+        # ``getvalue`` returns the cached payload without mutating the pointer so the
+        # uploaded data persists across reruns.
+        data = upload.getvalue()
         if isinstance(data, str):
             return data
         return data.decode("utf-8")
@@ -136,106 +157,93 @@ def _build_prompt(
     return "\n".join(prompt_parts)
 
 
-def _call_mistral(prompt: str, settings: LLMSettings) -> str:
-    """Call the configured Mistral-compatible backend and return the completion text."""
+def _resolve_mistral_configuration() -> tuple[str, Optional[str]]:
+    """Derive the API endpoint and key from secrets, env vars, or user input."""
 
-    system_message = "You are a helpful secure coding assistant."
+    endpoint_candidates = [
+        st.session_state.get("mistral_endpoint"),
+        _get_secret("MISTRAL_ENDPOINT"),
+        os.getenv("MISTRAL_ENDPOINT"),
+        DEFAULT_MISTRAL_ENDPOINT,
+    ]
+    endpoint = next((value for value in endpoint_candidates if value), DEFAULT_MISTRAL_ENDPOINT)
 
-    if settings.provider in {"hosted", "custom"}:
-        if not settings.api_key:
-            return (
-                "No Mistral API key provided. Configure the API key in the sidebar "
-                "to contact the hosted Mistral service."
-            )
+    api_key_candidates = [
+        st.session_state.get("mistral_api_key"),
+        _get_secret("MISTRAL_API_KEY"),
+        os.getenv("MISTRAL_API_KEY"),
+    ]
+    api_key = next((value for value in api_key_candidates if value), None)
 
-        headers = {
-            "Authorization": f"Bearer {settings.api_key}",
-            "Content-Type": "application/json",
-        }
-        if settings.access_token:
-            headers["X-Access-Token"] = settings.access_token
-
-        payload = {
-            "model": settings.model,
-            "temperature": settings.temperature,
-            "messages": [
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": prompt},
-            ],
-        }
-
-        try:
-            response = requests.post(
-                settings.endpoint,
-                headers=headers,
-                data=json.dumps(payload),
-                timeout=60,
-            )
-            response.raise_for_status()
-            body = response.json()
-            choices = body.get("choices", [])
-            if not choices:
-                return "No completion returned by the Mistral API."
-            return choices[0].get("message", {}).get("content", "No content in completion message.")
-        except requests.RequestException as exc:
-            return f"Mistral API request failed: {exc}"
-        except (json.JSONDecodeError, KeyError) as exc:
-            return f"Unexpected response format from Mistral API: {exc}"
-
-    if settings.provider == "ollama":
-        payload = {
-            "model": settings.model,
-            "messages": [
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": prompt},
-            ],
-            "stream": False,
-            "options": {"temperature": settings.temperature},
-        }
-
-        try:
-            response = requests.post(
-                settings.ollama_url.rstrip("/") + OLLAMA_CHAT_PATH,
-                headers={"Content-Type": "application/json"},
-                data=json.dumps(payload),
-                timeout=60,
-            )
-            response.raise_for_status()
-            body = response.json()
-            message = body.get("message") or {}
-            if isinstance(message, dict):
-                content = message.get("content")
-                if content:
-                    return content
-            # Some Ollama builds return a list of messages under "messages"
-            messages = body.get("messages")
-            if isinstance(messages, list) and messages:
-                last = messages[-1]
-                if isinstance(last, dict):
-                    content = last.get("content")
-                    if content:
-                        return content
-            return "No completion returned by the Ollama API."
-        except requests.RequestException as exc:
-            return f"Ollama request failed: {exc}"
-        except json.JSONDecodeError as exc:
-            return f"Unexpected response format from Ollama: {exc}"
-
-    return "Unsupported provider selected."
+    return endpoint, api_key
 
 
-def _render_sidebar() -> LLMSettings:
-    st.sidebar.header("LLM Configuration")
+def _call_mistral(
+    prompt: str,
+    model: str,
+    temperature: float,
+) -> str:
+    """Call the Mistral chat completion API."""
 
-    provider_labels = {
-        "hosted": "Mistral Hosted API",
-        "custom": "Custom Mistral Endpoint",
-        "ollama": "Ollama (Mistral Model)",
+    endpoint, api_key = _resolve_mistral_configuration()
+    if not api_key:
+        return (
+            "A Mistral API key is required. Provide it via `.streamlit/secrets.toml`, the "
+            "MISTRAL_API_KEY environment variable, or the sidebar configuration panel."
+        )
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
     }
-    provider = st.sidebar.radio(
-        "Provider",
-        options=list(provider_labels.keys()),
-        format_func=lambda key: provider_labels[key],
+
+    payload = {
+        "model": model,
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": "You are a helpful secure coding assistant."},
+            {"role": "user", "content": prompt},
+        ],
+    }
+
+    try:
+        response = requests.post(endpoint, headers=headers, data=json.dumps(payload), timeout=60)
+        response.raise_for_status()
+        body = response.json()
+        choices = body.get("choices", [])
+        if not choices:
+            return "No completion returned by the Mistral API."
+        return choices[0].get("message", {}).get("content", "No content in completion message.")
+    except requests.RequestException as exc:
+        return f"Mistral API request failed: {exc}"
+    except (json.JSONDecodeError, KeyError) as exc:
+        return f"Unexpected response format from Mistral API: {exc}"
+
+
+def _render_sidebar() -> tuple[str, float]:
+    st.sidebar.header("Mistral Settings")
+
+    st.session_state.setdefault(
+        "mistral_endpoint",
+        _get_secret("MISTRAL_ENDPOINT")
+        or os.getenv("MISTRAL_ENDPOINT")
+        or DEFAULT_MISTRAL_ENDPOINT,
+    )
+    st.session_state.setdefault(
+        "mistral_api_key",
+        _get_secret("MISTRAL_API_KEY")
+        or os.getenv("MISTRAL_API_KEY")
+        or "",
+    )
+    model = st.sidebar.selectbox(
+        "Model",
+        options=[
+            "mistral-small-latest",
+            "mistral-medium-latest",
+            "mistral-large-latest",
+        ],
+        index=0,
+        help="Choose the hosted Mistral model to generate secure code recommendations.",
     )
 
     temperature = st.sidebar.slider(
@@ -318,7 +326,26 @@ def _render_sidebar() -> LLMSettings:
         """
     )
 
-    return settings
+    with st.sidebar.expander("API Configuration", expanded=False):
+        st.text_input(
+            "Mistral API endpoint",
+            key="mistral_endpoint",
+            help=(
+                "Override the API endpoint if you are routing requests through a proxy or "
+                "self-hosted deployment."
+            ),
+        )
+        st.text_input(
+            "Mistral API key",
+            key="mistral_api_key",
+            type="password",
+            help=(
+                "Stored only in the current Streamlit session. You can also configure this via "
+                "MISTRAL_API_KEY or `.streamlit/secrets.toml`."
+            ),
+        )
+
+    return model, temperature
 
 
 def main() -> None:
