@@ -11,6 +11,7 @@ import streamlit as st
 
 
 MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
+OLLAMA_CHAT_PATH = "/api/chat"
 
 
 @dataclass
@@ -20,6 +21,19 @@ class ScanOption:
     label: str
     description: str
     prompt_snippet: str
+
+
+@dataclass
+class LLMSettings:
+    """Configuration values required to contact the selected LLM backend."""
+
+    provider: str
+    model: str
+    temperature: float
+    api_key: Optional[str] = None
+    access_token: Optional[str] = None
+    endpoint: str = MISTRAL_ENDPOINT
+    ollama_url: str = "http://localhost:11434"
 
 
 SCAN_OPTIONS: List[ScanOption] = [
@@ -111,66 +125,117 @@ def _build_prompt(
 
     prompt_parts.append("")
     prompt_parts.append(
-        "Respond with a structured analysis that includes findings, remediation steps, "
-        "and any additional secure coding guidelines that apply."
+        "Produce the updated secure code that addresses the identified issues, including inline comments "
+        "that explain the security hardening choices."
+    )
+    prompt_parts.append(
+        "Wrap code snippets in fenced Markdown blocks, and precede them with short explanations of the "
+        "changes so the user understands the mitigation steps."
     )
 
     return "\n".join(prompt_parts)
 
 
-def _call_mistral(
-    prompt: str,
-    model: str,
-    temperature: float,
-) -> str:
-    """Call the Mistral chat completion API."""
+def _call_mistral(prompt: str, settings: LLMSettings) -> str:
+    """Call the configured Mistral-compatible backend and return the completion text."""
 
-    api_key = os.getenv("MISTRAL_API_KEY")
-    if not api_key:
-        return (
-            "MISTRAL_API_KEY environment variable is not set. "
-            "Unable to contact the Mistral API."
-        )
+    system_message = "You are a helpful secure coding assistant."
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+    if settings.provider in {"hosted", "custom"}:
+        if not settings.api_key:
+            return (
+                "No Mistral API key provided. Configure the API key in the sidebar "
+                "to contact the hosted Mistral service."
+            )
+
+        headers = {
+            "Authorization": f"Bearer {settings.api_key}",
+            "Content-Type": "application/json",
+        }
+        if settings.access_token:
+            headers["X-Access-Token"] = settings.access_token
+
+        payload = {
+            "model": settings.model,
+            "temperature": settings.temperature,
+            "messages": [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": prompt},
+            ],
+        }
+
+        try:
+            response = requests.post(
+                settings.endpoint,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=60,
+            )
+            response.raise_for_status()
+            body = response.json()
+            choices = body.get("choices", [])
+            if not choices:
+                return "No completion returned by the Mistral API."
+            return choices[0].get("message", {}).get("content", "No content in completion message.")
+        except requests.RequestException as exc:
+            return f"Mistral API request failed: {exc}"
+        except (json.JSONDecodeError, KeyError) as exc:
+            return f"Unexpected response format from Mistral API: {exc}"
+
+    if settings.provider == "ollama":
+        payload = {
+            "model": settings.model,
+            "messages": [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "options": {"temperature": settings.temperature},
+        }
+
+        try:
+            response = requests.post(
+                settings.ollama_url.rstrip("/") + OLLAMA_CHAT_PATH,
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(payload),
+                timeout=60,
+            )
+            response.raise_for_status()
+            body = response.json()
+            message = body.get("message") or {}
+            if isinstance(message, dict):
+                content = message.get("content")
+                if content:
+                    return content
+            # Some Ollama builds return a list of messages under "messages"
+            messages = body.get("messages")
+            if isinstance(messages, list) and messages:
+                last = messages[-1]
+                if isinstance(last, dict):
+                    content = last.get("content")
+                    if content:
+                        return content
+            return "No completion returned by the Ollama API."
+        except requests.RequestException as exc:
+            return f"Ollama request failed: {exc}"
+        except json.JSONDecodeError as exc:
+            return f"Unexpected response format from Ollama: {exc}"
+
+    return "Unsupported provider selected."
+
+
+def _render_sidebar() -> LLMSettings:
+    st.sidebar.header("LLM Configuration")
+
+    provider_labels = {
+        "hosted": "Mistral Hosted API",
+        "custom": "Custom Mistral Endpoint",
+        "ollama": "Ollama (Mistral Model)",
     }
-
-    payload = {
-        "model": model,
-        "temperature": temperature,
-        "messages": [
-            {"role": "system", "content": "You are a helpful secure coding assistant."},
-            {"role": "user", "content": prompt},
-        ],
-    }
-
-    try:
-        response = requests.post(MISTRAL_ENDPOINT, headers=headers, data=json.dumps(payload), timeout=60)
-        response.raise_for_status()
-        body = response.json()
-        choices = body.get("choices", [])
-        if not choices:
-            return "No completion returned by the Mistral API."
-        return choices[0].get("message", {}).get("content", "No content in completion message.")
-    except requests.RequestException as exc:
-        return f"Mistral API request failed: {exc}"
-    except (json.JSONDecodeError, KeyError) as exc:
-        return f"Unexpected response format from Mistral API: {exc}"
-
-
-def _render_sidebar() -> tuple[str, float]:
-    st.sidebar.header("Mistral Settings")
-    model = st.sidebar.selectbox(
-        "Model",
-        options=[
-            "mistral-small-latest",
-            "mistral-medium-latest",
-            "mistral-large-latest",
-        ],
-        index=0,
-        help="Choose the hosted Mistral model to generate secure code recommendations.",
+    provider = st.sidebar.radio(
+        "Provider",
+        options=list(provider_labels.keys()),
+        format_func=lambda key: provider_labels[key],
     )
 
     temperature = st.sidebar.slider(
@@ -182,6 +247,68 @@ def _render_sidebar() -> tuple[str, float]:
         help="Lower values make the model more deterministic; higher values increase creativity.",
     )
 
+    if provider in {"hosted", "custom"}:
+        default_endpoint = MISTRAL_ENDPOINT
+        if provider == "custom":
+            default_endpoint = os.getenv("MISTRAL_API_ENDPOINT", MISTRAL_ENDPOINT)
+
+        endpoint = st.sidebar.text_input(
+            "Mistral API Endpoint",
+            value=default_endpoint,
+            help="Override the Mistral API endpoint when using a self-hosted deployment.",
+        )
+
+        api_key = st.sidebar.text_input(
+            "Mistral API Key",
+            value=os.getenv("MISTRAL_API_KEY", ""),
+            type="password",
+            help="API key for authenticating with the Mistral service.",
+        )
+        access_token = st.sidebar.text_input(
+            "Access Token (optional)",
+            value=os.getenv("MISTRAL_ACCESS_TOKEN", ""),
+            type="password",
+            help="Optional secondary access token for custom deployments.",
+        )
+
+        model = st.sidebar.selectbox(
+            "Model",
+            options=[
+                "mistral-small-latest",
+                "mistral-medium-latest",
+                "mistral-large-latest",
+            ],
+            index=0,
+            help="Choose the hosted or custom Mistral model used to generate secure code.",
+        )
+
+        settings = LLMSettings(
+            provider=provider,
+            model=model,
+            temperature=temperature,
+            api_key=api_key or None,
+            access_token=access_token or None,
+            endpoint=endpoint or MISTRAL_ENDPOINT,
+        )
+    else:
+        ollama_url = st.sidebar.text_input(
+            "Ollama API URL",
+            value=os.getenv("OLLAMA_API_URL", "http://localhost:11434"),
+            help="Base URL where the Ollama service is reachable.",
+        )
+        ollama_model = st.sidebar.text_input(
+            "Ollama Model",
+            value=os.getenv("OLLAMA_MODEL", "mistral"),
+            help="Name of the Mistral model available within Ollama.",
+        )
+
+        settings = LLMSettings(
+            provider=provider,
+            model=ollama_model or "mistral",
+            temperature=temperature,
+            ollama_url=ollama_url or "http://localhost:11434",
+        )
+
     st.sidebar.markdown(
         """
         **Usage Tips**
@@ -191,7 +318,7 @@ def _render_sidebar() -> tuple[str, float]:
         """
     )
 
-    return model, temperature
+    return settings
 
 
 def main() -> None:
@@ -202,7 +329,7 @@ def main() -> None:
         "for actionable secure coding recommendations."
     )
 
-    model, temperature = _render_sidebar()
+    llm_settings = _render_sidebar()
 
     with st.expander("Input Guidance", expanded=False):
         st.markdown(
@@ -245,16 +372,16 @@ def main() -> None:
 
     st.markdown("---")
 
-    if st.button("Generate Secure Recommendations", type="primary"):
+    if st.button("Generate Secure Code", type="primary"):
         if not instructions.strip() and not manifest_content and not scan_content:
             st.warning("Please provide instructions, a manifest file, or scan results to generate recommendations.")
             return
 
-        with st.spinner("Contacting Mistral and assembling recommendations..."):
+        with st.spinner("Contacting the configured Mistral model and generating secure code..."):
             prompt = _build_prompt(instructions, manifest_content, scan_content, selected_options)
-            response = _call_mistral(prompt, model=model, temperature=temperature)
+            response = _call_mistral(prompt, settings=llm_settings)
 
-        st.markdown("## Recommended Actions")
+        st.markdown("## Security-Hardened Code Suggestions")
         st.markdown(response)
 
         st.download_button(
