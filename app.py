@@ -39,6 +39,19 @@ class ScanOption:
     prompt_snippet: str
 
 
+@dataclass
+class LLMSettings:
+    """Configuration values required to contact the selected LLM backend."""
+
+    provider: str
+    model: str
+    temperature: float
+    api_key: Optional[str] = None
+    access_token: Optional[str] = None
+    endpoint: str = MISTRAL_ENDPOINT
+    ollama_url: str = "http://localhost:11434"
+
+
 SCAN_OPTIONS: List[ScanOption] = [
     ScanOption(
         label="Dependency Vulnerability Scan",
@@ -133,8 +146,12 @@ def _build_prompt(
 
     prompt_parts.append("")
     prompt_parts.append(
-        "Respond with a structured analysis that includes findings, remediation steps, "
-        "and any additional secure coding guidelines that apply."
+        "Produce the updated secure code that addresses the identified issues, including inline comments "
+        "that explain the security hardening choices."
+    )
+    prompt_parts.append(
+        "Wrap code snippets in fenced Markdown blocks, and precede them with short explanations of the "
+        "changes so the user understands the mitigation steps."
     )
 
     return "\n".join(prompt_parts)
@@ -238,6 +255,68 @@ def _render_sidebar() -> tuple[str, float]:
         help="Lower values make the model more deterministic; higher values increase creativity.",
     )
 
+    if provider in {"hosted", "custom"}:
+        default_endpoint = MISTRAL_ENDPOINT
+        if provider == "custom":
+            default_endpoint = os.getenv("MISTRAL_API_ENDPOINT", MISTRAL_ENDPOINT)
+
+        endpoint = st.sidebar.text_input(
+            "Mistral API Endpoint",
+            value=default_endpoint,
+            help="Override the Mistral API endpoint when using a self-hosted deployment.",
+        )
+
+        api_key = st.sidebar.text_input(
+            "Mistral API Key",
+            value=os.getenv("MISTRAL_API_KEY", ""),
+            type="password",
+            help="API key for authenticating with the Mistral service.",
+        )
+        access_token = st.sidebar.text_input(
+            "Access Token (optional)",
+            value=os.getenv("MISTRAL_ACCESS_TOKEN", ""),
+            type="password",
+            help="Optional secondary access token for custom deployments.",
+        )
+
+        model = st.sidebar.selectbox(
+            "Model",
+            options=[
+                "mistral-small-latest",
+                "mistral-medium-latest",
+                "mistral-large-latest",
+            ],
+            index=0,
+            help="Choose the hosted or custom Mistral model used to generate secure code.",
+        )
+
+        settings = LLMSettings(
+            provider=provider,
+            model=model,
+            temperature=temperature,
+            api_key=api_key or None,
+            access_token=access_token or None,
+            endpoint=endpoint or MISTRAL_ENDPOINT,
+        )
+    else:
+        ollama_url = st.sidebar.text_input(
+            "Ollama API URL",
+            value=os.getenv("OLLAMA_API_URL", "http://localhost:11434"),
+            help="Base URL where the Ollama service is reachable.",
+        )
+        ollama_model = st.sidebar.text_input(
+            "Ollama Model",
+            value=os.getenv("OLLAMA_MODEL", "mistral"),
+            help="Name of the Mistral model available within Ollama.",
+        )
+
+        settings = LLMSettings(
+            provider=provider,
+            model=ollama_model or "mistral",
+            temperature=temperature,
+            ollama_url=ollama_url or "http://localhost:11434",
+        )
+
     st.sidebar.markdown(
         """
         **Usage Tips**
@@ -277,7 +356,7 @@ def main() -> None:
         "for actionable secure coding recommendations."
     )
 
-    model, temperature = _render_sidebar()
+    llm_settings = _render_sidebar()
 
     with st.expander("Input Guidance", expanded=False):
         st.markdown(
@@ -320,16 +399,16 @@ def main() -> None:
 
     st.markdown("---")
 
-    if st.button("Generate Secure Recommendations", type="primary"):
+    if st.button("Generate Secure Code", type="primary"):
         if not instructions.strip() and not manifest_content and not scan_content:
             st.warning("Please provide instructions, a manifest file, or scan results to generate recommendations.")
             return
 
-        with st.spinner("Contacting Mistral and assembling recommendations..."):
+        with st.spinner("Contacting the configured Mistral model and generating secure code..."):
             prompt = _build_prompt(instructions, manifest_content, scan_content, selected_options)
-            response = _call_mistral(prompt, model=model, temperature=temperature)
+            response = _call_mistral(prompt, settings=llm_settings)
 
-        st.markdown("## Recommended Actions")
+        st.markdown("## Security-Hardened Code Suggestions")
         st.markdown(response)
 
         st.download_button(
