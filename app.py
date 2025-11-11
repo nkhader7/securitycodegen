@@ -10,7 +10,24 @@ import requests
 import streamlit as st
 
 
-MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
+DEFAULT_MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
+
+
+def _get_secret(name: str) -> Optional[str]:
+    """Safely retrieve a Streamlit secret when configured."""
+
+    secrets = getattr(st, "secrets", None)
+    if secrets is None:
+        return None
+
+    getter = getattr(secrets, "get", None)
+    if callable(getter):
+        return getter(name)
+
+    try:
+        return secrets[name]  # type: ignore[index]
+    except Exception:  # pragma: no cover - defensive for unexpected secrets objects
+        return None
 
 
 @dataclass
@@ -48,7 +65,12 @@ def _read_uploaded_file(upload) -> Optional[str]:
         return None
 
     try:
-        data = upload.read()
+        # ``UploadedFile.read`` exhausts the underlying buffer. When Streamlit reruns the
+        # script (e.g., due to widget interaction) the same ``UploadedFile`` instance is
+        # reused with its pointer already positioned at EOF, yielding empty content.
+        # ``getvalue`` returns the cached payload without mutating the pointer so the
+        # uploaded data persists across reruns.
+        data = upload.getvalue()
         if isinstance(data, str):
             return data
         return data.decode("utf-8")
@@ -118,6 +140,27 @@ def _build_prompt(
     return "\n".join(prompt_parts)
 
 
+def _resolve_mistral_configuration() -> tuple[str, Optional[str]]:
+    """Derive the API endpoint and key from secrets, env vars, or user input."""
+
+    endpoint_candidates = [
+        st.session_state.get("mistral_endpoint"),
+        _get_secret("MISTRAL_ENDPOINT"),
+        os.getenv("MISTRAL_ENDPOINT"),
+        DEFAULT_MISTRAL_ENDPOINT,
+    ]
+    endpoint = next((value for value in endpoint_candidates if value), DEFAULT_MISTRAL_ENDPOINT)
+
+    api_key_candidates = [
+        st.session_state.get("mistral_api_key"),
+        _get_secret("MISTRAL_API_KEY"),
+        os.getenv("MISTRAL_API_KEY"),
+    ]
+    api_key = next((value for value in api_key_candidates if value), None)
+
+    return endpoint, api_key
+
+
 def _call_mistral(
     prompt: str,
     model: str,
@@ -125,11 +168,11 @@ def _call_mistral(
 ) -> str:
     """Call the Mistral chat completion API."""
 
-    api_key = os.getenv("MISTRAL_API_KEY")
+    endpoint, api_key = _resolve_mistral_configuration()
     if not api_key:
         return (
-            "MISTRAL_API_KEY environment variable is not set. "
-            "Unable to contact the Mistral API."
+            "A Mistral API key is required. Provide it via `.streamlit/secrets.toml`, the "
+            "MISTRAL_API_KEY environment variable, or the sidebar configuration panel."
         )
 
     headers = {
@@ -147,7 +190,7 @@ def _call_mistral(
     }
 
     try:
-        response = requests.post(MISTRAL_ENDPOINT, headers=headers, data=json.dumps(payload), timeout=60)
+        response = requests.post(endpoint, headers=headers, data=json.dumps(payload), timeout=60)
         response.raise_for_status()
         body = response.json()
         choices = body.get("choices", [])
@@ -162,6 +205,19 @@ def _call_mistral(
 
 def _render_sidebar() -> tuple[str, float]:
     st.sidebar.header("Mistral Settings")
+
+    st.session_state.setdefault(
+        "mistral_endpoint",
+        _get_secret("MISTRAL_ENDPOINT")
+        or os.getenv("MISTRAL_ENDPOINT")
+        or DEFAULT_MISTRAL_ENDPOINT,
+    )
+    st.session_state.setdefault(
+        "mistral_api_key",
+        _get_secret("MISTRAL_API_KEY")
+        or os.getenv("MISTRAL_API_KEY")
+        or "",
+    )
     model = st.sidebar.selectbox(
         "Model",
         options=[
@@ -190,6 +246,25 @@ def _render_sidebar() -> tuple[str, float]:
         - Include scan reports to get tailored remediation steps.
         """
     )
+
+    with st.sidebar.expander("API Configuration", expanded=False):
+        st.text_input(
+            "Mistral API endpoint",
+            key="mistral_endpoint",
+            help=(
+                "Override the API endpoint if you are routing requests through a proxy or "
+                "self-hosted deployment."
+            ),
+        )
+        st.text_input(
+            "Mistral API key",
+            key="mistral_api_key",
+            type="password",
+            help=(
+                "Stored only in the current Streamlit session. You can also configure this via "
+                "MISTRAL_API_KEY or `.streamlit/secrets.toml`."
+            ),
+        )
 
     return model, temperature
 
