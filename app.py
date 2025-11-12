@@ -9,8 +9,14 @@ from typing import List, Optional
 import requests
 import streamlit as st
 
+from api_settings import API_ENDPOINTS, get_endpoint
 
-DEFAULT_MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
+MISTRAL_ENDPOINT_CONFIG = API_ENDPOINTS["mistral"]
+DEFAULT_MISTRAL_ENDPOINT = MISTRAL_ENDPOINT_CONFIG.default
+MISTRAL_ENDPOINT_ENV_VAR = MISTRAL_ENDPOINT_CONFIG.env_var
+
+OLLAMA_ENDPOINT_CONFIG = API_ENDPOINTS["ollama"]
+DEFAULT_OLLAMA_URL = OLLAMA_ENDPOINT_CONFIG.default
 
 
 def _get_secret(name: str) -> Optional[str]:
@@ -48,8 +54,8 @@ class LLMSettings:
     temperature: float
     api_key: Optional[str] = None
     access_token: Optional[str] = None
-    endpoint: str = MISTRAL_ENDPOINT
-    ollama_url: str = "http://localhost:11434"
+    endpoint: str = DEFAULT_MISTRAL_ENDPOINT
+    ollama_url: str = DEFAULT_OLLAMA_URL
 
 
 SCAN_OPTIONS: List[ScanOption] = [
@@ -162,9 +168,8 @@ def _resolve_mistral_configuration() -> tuple[str, Optional[str]]:
 
     endpoint_candidates = [
         st.session_state.get("mistral_endpoint"),
-        _get_secret("MISTRAL_ENDPOINT"),
-        os.getenv("MISTRAL_ENDPOINT"),
-        DEFAULT_MISTRAL_ENDPOINT,
+        _get_secret(MISTRAL_ENDPOINT_ENV_VAR),
+        get_endpoint("mistral"),
     ]
     endpoint = next((value for value in endpoint_candidates if value), DEFAULT_MISTRAL_ENDPOINT)
 
@@ -225,9 +230,8 @@ def _render_sidebar() -> tuple[str, float]:
 
     st.session_state.setdefault(
         "mistral_endpoint",
-        _get_secret("MISTRAL_ENDPOINT")
-        or os.getenv("MISTRAL_ENDPOINT")
-        or DEFAULT_MISTRAL_ENDPOINT,
+        _get_secret(MISTRAL_ENDPOINT_ENV_VAR)
+        or get_endpoint("mistral"),
     )
     st.session_state.setdefault(
         "mistral_api_key",
@@ -256,9 +260,9 @@ def _render_sidebar() -> tuple[str, float]:
     )
 
     if provider in {"hosted", "custom"}:
-        default_endpoint = MISTRAL_ENDPOINT
+        default_endpoint = DEFAULT_MISTRAL_ENDPOINT
         if provider == "custom":
-            default_endpoint = os.getenv("MISTRAL_API_ENDPOINT", MISTRAL_ENDPOINT)
+            default_endpoint = os.getenv("MISTRAL_API_ENDPOINT", DEFAULT_MISTRAL_ENDPOINT)
 
         endpoint = st.sidebar.text_input(
             "Mistral API Endpoint",
@@ -296,12 +300,12 @@ def _render_sidebar() -> tuple[str, float]:
             temperature=temperature,
             api_key=api_key or None,
             access_token=access_token or None,
-            endpoint=endpoint or MISTRAL_ENDPOINT,
+            endpoint=endpoint or DEFAULT_MISTRAL_ENDPOINT,
         )
     else:
         ollama_url = st.sidebar.text_input(
             "Ollama API URL",
-            value=os.getenv("OLLAMA_API_URL", "http://localhost:11434"),
+            value=get_endpoint("ollama"),
             help="Base URL where the Ollama service is reachable.",
         )
         ollama_model = st.sidebar.text_input(
@@ -314,7 +318,7 @@ def _render_sidebar() -> tuple[str, float]:
             provider=provider,
             model=ollama_model or "mistral",
             temperature=temperature,
-            ollama_url=ollama_url or "http://localhost:11434",
+            ollama_url=ollama_url or DEFAULT_OLLAMA_URL,
         )
 
     st.sidebar.markdown(
